@@ -125,8 +125,9 @@ echo "Creating new database..."
 docker exec "$DB_CONTAINER" psql -U dhis -d postgres -c "CREATE DATABASE dhis2;" >/dev/null 2>&1
 
 # Use appropriate restore method based on file type
-# Set timeout to 30 minutes (1800 seconds) for large databases
-RESTORE_TIMEOUT=1800
+# Set timeout to 8 hours (28800 seconds) for very large databases
+# This can be adjusted based on your database sizes
+RESTORE_TIMEOUT=28800
 RESTORE_FAILED=0
 
 if [[ "$DUMP_FILE" == *.pgc ]]; then
