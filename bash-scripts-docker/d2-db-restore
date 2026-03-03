@@ -1,0 +1,177 @@
+#!/bin/bash
+#       ____  __  ______________
+#      / __ \/ / / /  _/ ___/__ \
+#     / / / / /_/ // / \__ \__/ /
+#    / /_/ / __  // / ___/ / __/
+#   /_____/_/ /_/___//____/____/
+#
+#   Script to restore database using plain Docker
+#   Updated with improvements from d2-instance-create
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Load common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/d2-lib.sh"
+
+# Timeout function to prevent hanging
+timeout_exec() {
+  local timeout=$1; shift
+  
+  # Start the command in background
+  "$@" &
+  local pid=$!
+  
+  # Wait for the command to complete or timeout
+  local start_time=$(date +%s)
+  while kill -0 $pid 2>/dev/null; do
+    local current_time=$(date +%s)
+    local elapsed=$((current_time - start_time))
+    
+    if [ $elapsed -ge $timeout ]; then
+      echo "❌ Timeout: Operation took longer than ${timeout} seconds"
+      kill $pid 2>/dev/null
+      return 1
+    fi
+    
+    # Show progress every 30 seconds
+    if [ $((elapsed % 30)) -eq 0 ] && [ $elapsed -gt 0 ]; then
+      echo "⏳ Still restoring... ($elapsed seconds elapsed)"
+    fi
+    
+    sleep 1
+  done
+  
+  # Get the return code of the command
+  wait $pid
+  return $?
+}
+
+# Check for required environment variable
+if [ -z "$DHIS2_BASE" ]; then
+  echo "Error: DHIS2_BASE environment variable not set"
+  exit 1
+fi
+
+usage() {
+  echo "Usage: $0 <instance name> <database_dump.sql[.gz]>"
+  echo "Example: $0 myinstance database.sql.gz"
+  echo "Example: $0 myinstance database.sql"
+  exit 1
+}
+
+if [ $# -ne 2 ]; then
+  usage
+fi
+
+INSTANCE=$1
+DUMP_FILE=$2
+DHIS2_HOME="$DHIS2_BASE/$INSTANCE"
+
+echo "DEBUG: DUMP_FILE=[$DUMP_FILE]"
+
+if [ ! -d "$DHIS2_HOME" ]; then
+  echo "Error: Instance $INSTANCE does not exist"
+  exit 1
+fi
+
+if [ ! -f "$DUMP_FILE" ]; then
+  echo "Error: Database dump file $DUMP_FILE not found"
+  exit 1
+fi
+
+# Create temp directory in instance home
+mkdir -p "$DHIS2_HOME/temp"
+TEMP_SQL="$DHIS2_HOME/temp/restore.sql"
+
+# Extract dump if gzipped
+if [[ "$DUMP_FILE" == *.gz ]]; then
+  gunzip -c "$DUMP_FILE" > "$TEMP_SQL"
+elif [[ "$DUMP_FILE" == *.pgc ]]; then
+  # .pgc is PostgreSQL custom format, keep as is for pg_restore
+  cp "$DUMP_FILE" "$TEMP_SQL"
+else
+  cp "$DUMP_FILE" "$TEMP_SQL"
+fi
+
+# Check if database container exists
+DB_CONTAINER=$(resolve_db_container "$INSTANCE") || {
+  echo "Error: Database container for instance $INSTANCE not found"
+  echo "Expected container names: ${INSTANCE}_db_1 or ${INSTANCE}-db-1"
+  exit 1
+}
+
+# Check if tomcat container exists
+TOMCAT_CONTAINER=$(resolve_tomcat_container "$INSTANCE") || TOMCAT_CONTAINER=""
+
+# Stop Tomcat container if it exists to prevent database access during restore
+if [ -n "$TOMCAT_CONTAINER" ]; then
+  docker stop "$TOMCAT_CONTAINER" >/dev/null 2>&1 || true
+fi
+
+# Copy dump to container and restore
+echo "Copying dump file to container..."
+RESTORE_LOG="$DHIS2_HOME/logs/database-restore-$(date +%Y%m%d-%H%M%S).log"
+docker cp "$TEMP_SQL" "$DB_CONTAINER:/tmp/restore.sql" >/dev/null
+echo "Restoring database..."
+
+# Drop existing database and create a fresh one to avoid conflicts
+echo "Dropping existing database..."
+# Connect to postgres database to terminate connections and drop database
+docker exec "$DB_CONTAINER" psql -U dhis -d postgres -c "SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname = 'dhis2';" >/dev/null 2>&1 || true
+docker exec "$DB_CONTAINER" psql -U dhis -d postgres -c "DROP DATABASE IF EXISTS dhis2;" >/dev/null 2>&1
+echo "Creating new database..."
+docker exec "$DB_CONTAINER" psql -U dhis -d postgres -c "CREATE DATABASE dhis2;" >/dev/null 2>&1
+
+# Use appropriate restore method based on file type
+# Set timeout to 30 minutes (1800 seconds) for large databases
+RESTORE_TIMEOUT=1800
+RESTORE_FAILED=0
+
+if [[ "$DUMP_FILE" == *.pgc ]]; then
+  # Use pg_restore for PostgreSQL custom format
+  echo "Using pg_restore for PostgreSQL custom format..."
+  echo "This may take several minutes depending on database size..."
+  # Use --no-owner to avoid ownership errors when postgres role doesn't exist
+  if ! timeout_exec $RESTORE_TIMEOUT docker exec "$DB_CONTAINER" pg_restore -U dhis -d dhis2 -j 4 --no-owner /tmp/restore.sql > "$RESTORE_LOG" 2>&1; then
+    RESTORE_FAILED=1
+  fi
+else
+  # Use psql for plain SQL files
+  echo "Using psql for SQL format..."
+  if ! timeout_exec $RESTORE_TIMEOUT docker exec "$DB_CONTAINER" psql -U dhis -d dhis2 -f /tmp/restore.sql > "$RESTORE_LOG" 2>&1; then
+    RESTORE_FAILED=1
+  fi
+fi
+
+if [ "$RESTORE_FAILED" -ne 0 ]; then
+  echo "❌ Error: Database restoration failed"
+  echo "Check the restore log for details: $RESTORE_LOG"
+  echo "Last 20 lines of restore log:"
+  tail -20 "$RESTORE_LOG"
+  
+  # Clean up before exiting
+  docker exec "$DB_CONTAINER" rm /tmp/restore.sql 2>/dev/null
+  rm -f "$TEMP_SQL"
+  exit 1
+fi
+
+echo "✅ Database restoration completed successfully!"
+
+# Clean up
+docker exec "$DB_CONTAINER" rm /tmp/restore.sql
+rm -f "$TEMP_SQL"
+
+# Restart Tomcat container
+echo "Restarting Tomcat container..."
+if [ -n "$TOMCAT_CONTAINER" ]; then
+  docker start "$TOMCAT_CONTAINER" >/dev/null 2>&1 || true
+fi
+
+echo "✅ Database restored to $INSTANCE"
+echo ""
+echo "💡 To verify the restore:"
+echo "  1. Check database: docker exec -it $DB_CONTAINER psql -U dhis -d dhis2"
+echo "  2. Check Tomcat logs: tail -f $DHIS2_HOME/logs/catalina.out"
+echo "  3. Check restore log: tail -f $RESTORE_LOG"

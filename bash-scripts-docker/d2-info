@@ -1,0 +1,84 @@
+#!/bin/bash
+# DHIS2 Instance Management Script
+# Lists all DHIS2 instances with key information
+
+set -u
+IFS=$'\n\t'
+
+# Load common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/d2-lib.sh"
+
+# Check for required environment variable
+if [ -z "$DHIS2_BASE" ]; then
+  echo "Error: DHIS2_BASE environment variable not set"
+  exit 1
+fi
+
+echo "DHIS2 Instances:"
+echo "================"
+echo ""
+
+# Find all DHIS2 instances by looking for tomcat containers
+INSTANCES=$(docker ps -a --format '{{.Names}}' | grep -E '^.*-tomcat-1$|^.*_tomcat_1$' | sed -E 's/(-tomcat-1|_tomcat_1)$//')
+
+if [ -z "$INSTANCES" ]; then
+  echo "No DHIS2 instances found."
+  exit 0
+fi
+
+# Header
+printf "%-20s %-10s %-10s %-10s %-15s\n" "Instance" "HTTP Port" "PG Port" "Version" "Status"
+echo "----------------------------------------------------------------------"
+
+for INSTANCE in $INSTANCES; do
+  # Get container names using helper functions
+  if ! TOMCAT_CONTAINER=$(resolve_tomcat_container "$INSTANCE" 2>/dev/null); then
+    TOMCAT_CONTAINER=""
+  fi
+  
+  if ! DB_CONTAINER=$(resolve_db_container "$INSTANCE" 2>/dev/null); then
+    DB_CONTAINER=""
+  fi
+  
+  # Get host-facing ports (extract from 0.0.0.0:HOST_PORT)
+  if [ -n "$TOMCAT_CONTAINER" ]; then
+    HTTP_PORT=$(docker port "$TOMCAT_CONTAINER" 8080/tcp 2>/dev/null | sed 's/.*:\([0-9]*\)$/\1/' || echo "-")
+  else
+    HTTP_PORT="-"
+  fi
+  
+  if [ -n "$DB_CONTAINER" ]; then
+    PG_PORT=$(docker port "$DB_CONTAINER" 5432/tcp 2>/dev/null | sed 's/.*:\([0-9]*\)$/\1/' || echo "-")
+  else
+    PG_PORT="-"
+  fi
+  
+  # Get DHIS2 version (major version only)
+  VERSION="-"
+  if [ -n "$DB_CONTAINER" ] && docker ps -a --format '{{.Names}}' | grep -q "^$DB_CONTAINER$"; then
+    FULL_VERSION=$(docker exec "$DB_CONTAINER" psql -U dhis -d dhis2 -t -c "SELECT version FROM flyway_schema_history ORDER BY version DESC LIMIT 1;" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$FULL_VERSION" ]; then
+      # Extract major version (e.g., 41 from 2.41.7)
+      VERSION=$(echo "$FULL_VERSION" | cut -d '.' -f 2)
+    fi
+  fi
+  
+  # Get status
+  TOMCAT_STATUS=$(docker inspect -f '{{.State.Status}}' "$TOMCAT_CONTAINER" 2>/dev/null || echo "missing")
+  DB_STATUS=$(docker inspect -f '{{.State.Status}}' "$DB_CONTAINER" 2>/dev/null || echo "missing")
+  
+  if [ "$TOMCAT_STATUS" = "running" ] && [ "$DB_STATUS" = "running" ]; then
+    STATUS="Running"
+  elif [ "$TOMCAT_STATUS" = "running" ] || [ "$DB_STATUS" = "running" ]; then
+    STATUS="Partial"
+  else
+    STATUS="Stopped"
+  fi
+  
+  # Output row
+  printf "%-20s %-10s %-10s %-10s %-15s\n" "$INSTANCE" "$HTTP_PORT" "$PG_PORT" "$VERSION" "$STATUS"
+done
+
+echo ""
+echo "Total instances: $(echo "$INSTANCES" | wc -w)"

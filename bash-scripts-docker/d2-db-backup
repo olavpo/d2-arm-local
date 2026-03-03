@@ -1,0 +1,72 @@
+#!/bin/bash
+# Simple script to create database backup in common [Backups] directory
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Define script directory for restore hint
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Check for required environment variable
+if [ -z "${DHIS2_BASE:-}" ]; then
+  echo "Error: DHIS2_BASE environment variable not set"
+  exit 1
+fi
+
+usage() {
+  echo "Usage: $0 <instance name>"
+  echo "Creates a timestamped database backup in the common [Backups] directory"
+  exit 1
+}
+
+if [ $# -eq 0 ]; then
+  usage
+fi
+
+INSTANCE=$1
+DHIS2_HOME="$DHIS2_BASE/$INSTANCE"
+BACKUP_DIR="$DHIS2_BASE/_backups/$INSTANCE"
+
+# Check if instance exists
+if [ ! -d "$DHIS2_HOME" ]; then
+  echo "Error: Instance $INSTANCE does not exist"
+  exit 1
+fi
+
+# Create [Backups] directory if it doesn't exist
+mkdir -p "$BACKUP_DIR"
+
+# Find database container
+if docker ps --format '{{.Names}}' | grep -q "^${INSTANCE}-db-1$"; then
+  DB_CONTAINER="${INSTANCE}-db-1"
+elif docker ps --format '{{.Names}}' | grep -q "^${INSTANCE}_db_1$"; then
+  DB_CONTAINER="${INSTANCE}_db_1"
+else
+  echo "Error: Database container for instance $INSTANCE not found"
+  exit 1
+fi
+
+# Query database for version to include in filename
+DB_VERSION=$(docker exec "$DB_CONTAINER" psql -U dhis -d dhis2 -t -c "SELECT version FROM flyway_schema_history ORDER BY version DESC LIMIT 1;" 2>/dev/null | tr -d ' ')
+
+# Create backup with timestamp and version
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+if [ -n "$DB_VERSION" ]; then
+  # Extract major version (e.g., 41 from 2.41.7)
+  MAJOR_VERSION=$(echo "$DB_VERSION" | cut -d '.' -f 2)
+  BACKUP_FILE="$BACKUP_DIR/${INSTANCE}_${TIMESTAMP}_v${MAJOR_VERSION}.sql.gz"
+else
+  BACKUP_FILE="$BACKUP_DIR/${INSTANCE}_${TIMESTAMP}.sql.gz"
+fi
+
+echo "Creating backup of $INSTANCE database..."
+echo "Backup will be saved to: $BACKUP_FILE"
+
+# Dump database and compress
+docker exec "$DB_CONTAINER" pg_dump -U dhis -d dhis2 | gzip > "$BACKUP_FILE"
+
+echo "✅ Backup created: $BACKUP_FILE"
+echo ""
+echo "💡 Backup location: $BACKUP_DIR/"
+echo "   Latest backup: $(basename "$BACKUP_FILE")"
+echo "   To restore: $SCRIPT_DIR/d2-db-restore $INSTANCE $BACKUP_FILE"

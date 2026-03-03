@@ -1,0 +1,218 @@
+#!/bin/bash
+#       ____  __  ______________
+#      / __ \/ / / /  _/ ___/__ \
+#     / / / / /_/ // / \__ \__/ /
+#    / /_/ / __  // / ___/ / __/
+#   /_____/_/ /_/___//____/____/
+#
+#   Script to create DHIS2 instance using plain Tomcat Docker with templates
+#   Simplified to use d2-deploy-war and d2-restore-db for WAR and DB operations
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Load common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/d2-lib.sh"
+
+
+
+usage() {
+  echo "Usage: $0 [options] <instance name>"
+  echo "Options:"
+  echo "  -v <version>    DHIS2 version to download and deploy"
+  echo "  -l <url>        URL to download WAR file from"
+  echo "  -s <db_file>    SQL database file to initialize with"
+  echo "  -p <port>       HTTP port (default: auto-select 9010-9050)"
+  echo "  -g <port>       PostgreSQL port (default: auto-select 5433-5999)"
+  echo "  -f <war_file>   Custom WAR file to deploy"
+  echo "  -t <version>    Tomcat version: 9 or 10 (default: 10)"
+  echo "Example: $0 -v 2.42.4 -p 9006 -g 5433 myinstance"
+  echo "Example with URL: $0 -l https://example.com/custom.war -p 9006 myinstance"
+  echo "Example with custom WAR: $0 -f /path/to/custom.war -p 9006 myinstance"
+  echo "Example with DB seed: $0 -s /path/to/seed.sql myinstance"
+  echo "Example with Tomcat 9: $0 -v 2.41.1 -t 9 myinstance"
+  echo "Example without WAR: $0 myinstance (auto-selects ports, no DHIS2)"
+  exit 1
+}
+
+# Default values
+VERSION=""
+WAR_URL=""
+DB_SEED=""
+HTTP_PORT=""
+PG_PORT=""
+WAR_FILE=""
+TOMCAT_VERSION="10"  # Default to Tomcat 10
+
+# Parse options
+while getopts "v:l:s:p:g:f:t:" opt; do
+  case $opt in
+    v) VERSION=$OPTARG ;;
+    l) WAR_URL=$OPTARG ;;
+    s) DB_SEED=$OPTARG ;;
+    p) HTTP_PORT=$OPTARG ;;
+    g) PG_PORT=$OPTARG ;;
+    f) WAR_FILE=$OPTARG ;;
+    t) TOMCAT_VERSION=$OPTARG ;;
+    *) usage ;;
+  esac
+done
+
+shift $((OPTIND-1))
+
+if [ $# -eq 0 ]; then
+  usage
+fi
+
+# Convert relative paths to absolute paths using helper function
+if [ -n "$WAR_FILE" ]; then
+  WAR_FILE=$(abspath "$WAR_FILE")
+fi
+
+if [ -n "$DB_SEED" ]; then
+  DB_SEED=$(abspath "$DB_SEED")
+fi
+
+INSTANCE=$1
+DHIS2_HOME="$DHIS2_BASE/$INSTANCE"
+
+# Show configuration for this deployment
+echo "WAR_FILE=$WAR_FILE"
+echo "WAR_URL=$WAR_URL"
+echo "DB_SEED=$DB_SEED"
+echo "VERSION=$VERSION"
+echo "HTTP_PORT=$HTTP_PORT"
+echo "PG_PORT=$PG_PORT"
+echo "TOMCAT_VERSION=$TOMCAT_VERSION"
+echo ""
+
+
+
+
+
+# Auto-select HTTP port if not specified
+if [ -z "$HTTP_PORT" ]; then
+  echo "Auto-selecting HTTP port..."
+  for port in $(seq 9010 9050); do
+    if ! docker ps --format '{{.Ports}}' | grep -q ":$port->"; then
+      if ! is_port_in_use "$port"; then
+        HTTP_PORT=$port
+        echo "Selected HTTP port: $HTTP_PORT"
+        break
+      fi
+    fi
+  done
+  
+  if [ -z "$HTTP_PORT" ]; then
+    echo "Error: No available HTTP ports found in range 9010-9050"
+    exit 1
+  fi
+fi
+
+# Auto-select PostgreSQL port if not specified
+if [ -z "$PG_PORT" ]; then
+  echo "Auto-selecting PostgreSQL port..."
+  for port in $(seq 5433 5999); do
+    if ! docker ps --format '{{.Ports}}' | grep -q ":$port->"; then
+      if ! is_port_in_use "$port"; then
+        PG_PORT=$port
+        echo "Selected PostgreSQL port: $PG_PORT"
+        break
+      fi
+    fi
+  done
+  
+  if [ -z "$PG_PORT" ]; then
+    echo "Error: No available PostgreSQL ports found in range 5433-5999"
+    exit 1
+  fi
+fi
+
+# Check if instance already exists
+if [ -d "$DHIS2_HOME" ]; then
+  echo "Error: Instance directory $DHIS2_HOME already exists"
+  echo "       Use d2-instance-delete or choose a different name."
+  exit 1
+fi
+
+# Create DHIS2 directory structure on host
+mkdir -p "$DHIS2_HOME"
+mkdir -p "$DHIS2_HOME/DHIS2_HOME"
+mkdir -p "$DHIS2_HOME/webapps"
+mkdir -p "$DHIS2_HOME/logs"
+mkdir -p "$DHIS2_HOME/temp"
+mkdir -p "$DHIS2_HOME/lib"
+mkdir -p "$DHIS2_HOME/backups"
+
+# Determine Tomcat version for display
+if [ "$TOMCAT_VERSION" = "9" ]; then
+  TOMCAT_DISPLAY="9 (JDK 17)"
+else
+  TOMCAT_DISPLAY="10 (JDK 17)"
+fi
+
+echo "Creating DHIS2 instance with Tomcat: $INSTANCE"
+echo "  DHIS2 Version: ${VERSION:-None}"
+echo "  Tomcat Version: $TOMCAT_DISPLAY"
+echo "  HTTP Port: $HTTP_PORT"
+echo "  PostgreSQL Port: $PG_PORT"
+
+# Copy template files
+cp "${DHIS2_BASE}/_templates/dhis.conf" "$DHIS2_HOME/DHIS2_HOME/dhis.conf"
+cp "${DHIS2_BASE}/_templates/log4j2.xml" "$DHIS2_HOME/DHIS2_HOME/log4j2.xml"
+cp "${DHIS2_BASE}/_templates/server.xml" "$DHIS2_HOME/server.xml"
+
+# Select appropriate template based on Tomcat version
+if [ "$TOMCAT_VERSION" = "9" ]; then
+  TEMPLATE_FILE="${DHIS2_BASE}/_templates/docker-compose-tomcat9.yml"
+else
+  TEMPLATE_FILE="${DHIS2_BASE}/_templates/docker-compose-tomcat10.yml"
+fi
+
+# Create docker-compose.yml from selected template
+sed "s/\${PG_PORT:-5432}/$PG_PORT/g; s/\${HTTP_PORT:-8080}/$HTTP_PORT/g" \
+  "$TEMPLATE_FILE" > "$DHIS2_HOME/docker-compose.yml"
+
+
+# Start the instance
+cd "$DHIS2_HOME"
+docker compose up -d
+
+# Wait for containers to be ready
+echo "Waiting for containers to initialize..."
+sleep 15
+
+# Deploy WAR file and/or restore database if specified
+if [ -n "$WAR_FILE" ] || [ -n "$WAR_URL" ] || [ -n "$VERSION" ] || [ -n "$DB_SEED" ]; then
+  echo "Deploying WAR file and/or restoring database..."
+  
+  # Restore database FIRST if specified (so database is ready when WAR starts)
+  if [ -n "$DB_SEED" ]; then
+    echo "Restoring database..."
+    "$SCRIPT_DIR/d2-db-restore" "$INSTANCE" "$DB_SEED"
+  fi
+  
+  # Deploy WAR file if specified (after database is restored)
+  if [ -n "$WAR_FILE" ] || [ -n "$WAR_URL" ] || [ -n "$VERSION" ]; then
+    echo "Deploying WAR file..."
+    if [ -n "$WAR_FILE" ]; then
+      "$SCRIPT_DIR/d2-deploy-war" -f "$WAR_FILE" "$INSTANCE"
+    elif [ -n "$WAR_URL" ]; then
+      "$SCRIPT_DIR/d2-deploy-war" -l "$WAR_URL" "$INSTANCE"
+    elif [ -n "$VERSION" ]; then
+      "$SCRIPT_DIR/d2-deploy-war" -v "$VERSION" "$INSTANCE"
+    fi
+  fi
+  
+  echo "✅ Deployment completed"
+fi
+
+# Final output
+echo ""
+echo "✅ DHIS2 instance $INSTANCE created successfully with Tomcat $TOMCAT_DISPLAY"
+echo "  Access: http://localhost:$HTTP_PORT"
+echo "  PostgreSQL: localhost:$PG_PORT (user: dhis, password: dhis, db: dhis2)"
+echo "  DHIS2_HOME: $DHIS2_HOME/DHIS2_HOME/"
+
+

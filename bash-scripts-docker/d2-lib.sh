@@ -1,0 +1,87 @@
+#!/bin/bash
+# d2-lib.sh - Common functions for DHIS2 Docker scripts
+
+# Container resolution functions
+resolve_db_container() {
+  local instance="$1"
+  if docker ps -a --format '{{.Names}}' | grep -q "^${instance}-db-1$"; then
+    echo "${instance}-db-1"
+  elif docker ps -a --format '{{.Names}}' | grep -q "^${instance}_db_1$"; then
+    echo "${instance}_db_1"
+  else
+    return 1
+  fi
+}
+
+resolve_tomcat_container() {
+  local instance="$1"
+  if docker ps -a --format '{{.Names}}' | grep -q "^${instance}-tomcat-1$"; then
+    echo "${instance}-tomcat-1"
+  elif docker ps -a --format '{{.Names}}' | grep -q "^${instance}_tomcat_1$"; then
+    echo "${instance}_tomcat_1"
+  else
+    return 1
+  fi
+}
+
+# Path resolution
+abspath() {
+  local p="$1"
+  [[ "$p" == /* ]] && { echo "$p"; return; }
+  if [[ "$p" == ./* ]]; then
+    echo "$(pwd)/${p:2}"
+  else
+    echo "$(pwd)/$p"
+  fi
+}
+
+# Port checking
+is_port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -tuln | grep -q ":$port "
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -tuln 2>/dev/null | grep -q ":$port "
+  else
+    return 1
+  fi
+}
+
+# Version normalization
+normalize_version() {
+  local v="$1"
+  if [[ "$v" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "2.${v}"
+  elif [[ "$v" =~ ^[0-9]+$ ]]; then
+    local major="$v"
+    local resolved
+    resolved=$(curl -s "https://s3-eu-west-1.amazonaws.com/releases.dhis2.org/?prefix=2.$major/" \
+      | grep -o "dhis2-stable-2\.$major\.[0-9.]*.war" \
+      | sort -V | tail -1 \
+      | sed 's/dhis2-stable-//;s/.war//')
+    if [ -z "$resolved" ]; then
+      echo "Error: could not resolve version for major $major" >&2
+      return 1
+    fi
+    echo "$resolved"
+  else
+    echo "$v"
+  fi
+}
+
+# Database readiness check
+wait_for_db() {
+  local db_container="$1"
+  local max_attempts=30
+  local attempt=0
+  
+  while [ $attempt -lt $max_attempts ]; do
+    if docker exec "$db_container" psql -U dhis -d dhis2 -c "SELECT 1;" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+  
+  return 1
+}

@@ -1,0 +1,95 @@
+#!/bin/bash
+# d2-db-version - Determine DHIS2 version from a database backup
+# Usage: d2-db-version <backup_file> [instance_name]
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Load common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/d2-lib.sh"
+
+# Check for required environment variable
+if [ -z "${DHIS2_BASE:-}" ]; then
+  echo "ERROR: DHIS2_BASE environment variable not set"
+  exit 1
+fi
+
+# Check for backup file argument
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 <backup_file> [instance_name]"
+  exit 1
+fi
+
+BACKUP_FILE="$1"
+INSTANCE_NAME="${2:-}"
+
+# Check if backup file exists
+if [ ! -f "$BACKUP_FILE" ]; then
+  echo "ERROR: Backup file $BACKUP_FILE not found"
+  exit 1
+fi
+
+# Generate random instance name if not provided
+if [ -z "$INSTANCE_NAME" ]; then
+  INSTANCE_NAME="dbversion_$(date +%s)_$RANDOM"
+fi
+
+# Check if instance already exists
+if [ -d "$DHIS2_BASE/$INSTANCE_NAME" ]; then
+  echo "ERROR: Instance $INSTANCE_NAME already exists"
+  exit 1
+fi
+
+# Create temporary instance for version detection
+echo "Creating temporary instance $INSTANCE_NAME..."
+if ! "$SCRIPT_DIR/d2-instance-create" "$INSTANCE_NAME"; then
+  echo "ERROR: Failed to create temporary instance"
+  exit 1
+fi
+
+# Restore the database
+echo "Restoring database from $BACKUP_FILE..."
+if ! "$SCRIPT_DIR/d2-db-restore" "$INSTANCE_NAME" "$BACKUP_FILE"; then
+  echo "ERROR: Failed to restore database"
+  "$SCRIPT_DIR/d2-instance-delete" "$INSTANCE_NAME"
+  exit 1
+fi
+
+# Get the version from flyway_schema_history
+if ! DB_CONTAINER=$(resolve_db_container "$INSTANCE_NAME" 2>/dev/null); then
+  echo "ERROR: Could not resolve database container"
+  "$SCRIPT_DIR/d2-instance-delete" "$INSTANCE_NAME"
+  exit 1
+fi
+
+# Wait for database to be ready
+echo "Waiting for database to be ready..."
+if ! wait_for_db "$DB_CONTAINER"; then
+  echo "ERROR: Database not ready"
+  "$SCRIPT_DIR/d2-instance-delete" "$INSTANCE_NAME"
+  exit 1
+fi
+
+# Query the version
+VERSION=$(docker exec "$DB_CONTAINER" psql -U dhis -d dhis2 -t -c "
+  SELECT version FROM flyway_schema_history 
+  ORDER BY version DESC LIMIT 1;
+" 2>/dev/null | tr -d '[:space:]')
+
+if [ -z "$VERSION" ]; then
+  echo "ERROR: Could not determine version from database"
+  "$SCRIPT_DIR/d2-instance-delete" "$INSTANCE_NAME"
+  exit 1
+fi
+
+# Extract major version
+MAJOR_VERSION=$(echo "$VERSION" | cut -d '.' -f 2)
+
+# Clean up
+"$SCRIPT_DIR/d2-instance-delete" "$INSTANCE_NAME"
+
+echo "DHIS2 Version: $VERSION"
+echo "Major Version: $MAJOR_VERSION"
+
+exit 0

@@ -1,0 +1,30 @@
+#!/bin/bash
+#       ____  __  ______________
+#      / __ \/ / / /  _/ ___/__ \
+#     / / / / /_/ // / \__ \__/ /
+#    / /_/ / __  // / ___/ / __/
+#   /_____/_/ /_/___//____/____/
+#
+#   DHIS2 instance startup script using d2 cluster CLI
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Check for required environment variable
+if [ -z "${DHIS2_BASE:-}" ]; then
+  echo "Error: DHIS2_BASE environment variable not set"
+  exit 1
+fi
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: d2-startup <instance name>"
+  exit 1
+fi
+
+INSTANCE=$1
+
+echo "Starting DHIS2 instance: $INSTANCE"
+cd "$DHIS2_BASE/$INSTANCE"
+docker compose up -d
+
+echo "DHIS2 instance $INSTANCE is starting..."

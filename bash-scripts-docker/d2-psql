@@ -1,0 +1,41 @@
+#!/bin/bash
+#       ____  __  ______________
+#      / __ \/ / / /  _/ ___/__ \
+#     / / / / /_/ // / \__ \__/ /
+#    / /_/ / __  // / ___/ / __/
+#   /_____/_/ /_/___//____/____/
+#
+#   Script to access PostgreSQL in a DHIS2 Docker instance
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Load common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/d2-lib.sh"
+
+# Check for required environment variable
+if [ -z "${DHIS2_BASE:-}" ]; then
+  echo "Error: DHIS2_BASE environment variable not set"
+  exit 1
+fi
+
+if [ "$#" -lt 1 ]; then
+  echo "usage: d2-psql <instance name> [psql arguments]"
+  echo "Example: d2-psql td6 -c 'SELECT count(*) FROM userinfo;'"
+  exit 1
+fi
+
+INSTANCE=$1
+shift  # Remove instance name from arguments
+
+# Find database container using helper function
+echo "Connecting to PostgreSQL in instance $INSTANCE..."
+DB_CONTAINER=$(resolve_db_container "$INSTANCE") || {
+  echo "Error: Database container for instance $INSTANCE not found"
+  echo "Expected container names: ${INSTANCE}-db-1 or ${INSTANCE}_db_1"
+  exit 1
+}
+
+# Connect to PostgreSQL with remaining arguments
+docker exec -it "$DB_CONTAINER" psql -U dhis -d dhis2 "$@"

@@ -1,0 +1,154 @@
+#!/bin/bash
+#       ____  __  ______________
+#      / __ \/ / / /  _/ ___/__ \
+#     / / / / /_/ // / \__ \__/ /
+#    / /_/ / __  // / ___/ / __/
+#   /_____/_/ /_/___//____/____/
+#
+#   Script to deploy WAR file to DHIS2 instance using Tomcat
+#   Updated with improvements from d2-instance-create
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Check for required environment variable
+if [ -z "$DHIS2_BASE" ]; then
+  echo "Error: DHIS2_BASE environment variable not set"
+  exit 1
+fi
+
+# Load common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/d2-lib.sh"
+
+usage() {
+  echo "Usage: $0 [options] <instance name>"
+  echo "Options:"
+  echo "  -f <file>    Use local WAR file"
+  echo "  -v <version> Download specific DHIS2 version"
+  echo "  -l <url>     Download from custom URL"
+  echo "  -p <port>    HTTP port for verification messages (default: 8080)"
+  echo "Example: $0 -v 2.42.4 myinstance"
+  echo "Example: $0 -f /path/to/custom.war myinstance"
+  echo "Example: $0 -l https://example.com/custom.war myinstance"
+  exit 1
+}
+
+# Default values
+WAR_FILE=""
+VERSION=""
+WAR_URL=""
+HTTP_PORT="8080"
+
+# Parse options
+while getopts "f:v:l:p:" opt; do
+  case $opt in
+    f) WAR_FILE=$OPTARG ;;
+    v) VERSION=$OPTARG ;;
+    l) WAR_URL=$OPTARG ;;
+    p) HTTP_PORT=$OPTARG ;;
+    *) usage ;;
+  esac
+done
+
+shift $((OPTIND-1))
+
+if [ $# -eq 0 ]; then
+  usage
+fi
+
+INSTANCE=$1
+DHIS2_HOME="$DHIS2_BASE/$INSTANCE"
+
+echo "DEBUG: WAR_FILE=[$WAR_FILE], WAR_URL=[$WAR_URL], VERSION=[$VERSION], HTTP_PORT=[$HTTP_PORT]"
+
+# Check if instance exists
+if [ ! -d "$DHIS2_HOME" ]; then
+  echo "Error: Instance $INSTANCE does not exist"
+  exit 1
+fi
+
+# Check if tomcat container is running
+CONTAINER=$(resolve_tomcat_container "$INSTANCE") || {
+  echo "Error: Tomcat container for instance $INSTANCE not found"
+  exit 1
+}
+
+# Stop Tomcat container to prevent issues during deployment
+docker stop "$CONTAINER" >/dev/null
+
+# Create temp directory in instance home
+mkdir -p "$DHIS2_HOME/temp"
+TEMP_WAR="$DHIS2_HOME/temp/dhis.war"
+
+# Download or use specified WAR file
+if [ -n "$WAR_FILE" ]; then
+  if [ ! -f "$WAR_FILE" ]; then
+    echo "Error: WAR file $WAR_FILE not found"
+    exit 1
+  fi
+  cp "$WAR_FILE" "$TEMP_WAR"
+elif [ -n "$WAR_URL" ]; then
+  if command -v wget >/dev/null 2>&1; then
+    wget -O "$TEMP_WAR" "$WAR_URL" >/dev/null 2>&1
+  elif command -v curl >/dev/null 2>&1; then
+    curl -L -o "$TEMP_WAR" "$WAR_URL" >/dev/null 2>&1
+  else
+    echo "Error: Neither wget nor curl found for downloading"
+    exit 1
+  fi
+  
+  # Verify the download was successful
+  if [ ! -f "$TEMP_WAR" ] || [ ! -s "$TEMP_WAR" ]; then
+    echo "Error: WAR file download failed or file is empty"
+    rm -f "$TEMP_WAR"
+    exit 1
+  fi
+elif [ -n "$VERSION" ]; then
+  # Normalize version using helper function
+  FULL_VERSION=$(normalize_version "$VERSION") || {
+    echo "Error: Version resolution failed for $VERSION"
+    exit 1
+  }
+  echo "Using DHIS2 version: $FULL_VERSION"
+  
+  # Extract major version for URL (e.g., 42 from 2.42.2)
+  MAJOR=$(echo "$FULL_VERSION" | cut -d '.' -f 2)
+  DOWNLOAD_URL="https://releases.dhis2.org/2.$MAJOR/dhis2-stable-$FULL_VERSION.war"
+  echo "Downloading from: $DOWNLOAD_URL"
+  if command -v wget >/dev/null 2>&1; then
+    wget -O "$TEMP_WAR" "$DOWNLOAD_URL" >/dev/null 2>&1
+  elif command -v curl >/dev/null 2>&1; then
+    curl -L -o "$TEMP_WAR" "$DOWNLOAD_URL" >/dev/null 2>&1
+  else
+    echo "Error: Neither wget nor curl found for downloading"
+    exit 1
+  fi
+  
+  # Verify the download was successful
+  if [ ! -f "$TEMP_WAR" ] || [ ! -s "$TEMP_WAR" ]; then
+    echo "Error: WAR file download failed or file is empty"
+    rm -f "$TEMP_WAR"
+    exit 1
+  fi
+else
+  echo "Error: No WAR file or version specified"
+  usage
+fi
+
+# Deploy WAR file to webapps directory
+cp "$TEMP_WAR" "$DHIS2_HOME/webapps/ROOT.war" >/dev/null
+
+# Clean up temporary file
+rm -f "$TEMP_WAR"
+
+# Restart Tomcat container
+docker start "$CONTAINER" >/dev/null
+
+echo "✅ WAR file deployed to $INSTANCE"
+echo "The container will automatically reload the WAR file."
+echo ""
+echo "💡 To verify the deployment:"
+echo "  1. Check logs: tail -f $DHIS2_HOME/logs/catalina.out"
+echo "  2. Test access: curl http://localhost:${HTTP_PORT}/api/system/info"
+echo "  3. Container status: docker logs -f $CONTAINER"
